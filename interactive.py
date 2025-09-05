@@ -17,7 +17,6 @@ Controls:
 import cv2
 import numpy as np
 import argparse
-import random
 import sys
 
 def parse_args():
@@ -27,6 +26,10 @@ def parse_args():
     parser.add_argument('--rows', type=int, default=5, help="Grid rows (default: 5).")
     parser.add_argument('--cols', type=int, default=4, help="Grid cols (default: 4).")
     parser.add_argument('--window', type=str, default='sleeping', help="Window name (default: 'sleeping').")
+    parser.add_argument('--stretch-px', type=int, default=None,
+                        help="Extra pixels to add to display height (default: 10% of image height).")
+    parser.add_argument('--bake-stretch', action='store_true',
+                        help="Bake the vertical stretch into the canvas instead of scaling at display time.")
     return parser.parse_args()
 
 def load_images(image_files):
@@ -94,12 +97,20 @@ def main():
 
     # Blank canvas same size as inputs
     canvas = np.zeros_like(images[0])
+    ih, iw = images[0].shape[:2]
+    extra_px = args.stretch_px if args.stretch_px is not None else int(round(ih * 0.10))
+    stretch_y = (ih + extra_px) / ih  # vertical stretch factor for display only
 
     # Track which source index is currently used for each cell (-1 = black)
     current_idx = {(i, j): -1 for i in range(rows) for j in range(cols)}
 
-    # Create window; AUTOSIZE keeps 1:1 pixel mapping with mouse events
+    # Create fixed-size autosized window; we will render a vertically stretched view
     cv2.namedWindow(args.window, cv2.WINDOW_AUTOSIZE)
+    # If baking stretch, keep a separate stretched canvas to draw 1:1
+    if args.bake_stretch:
+        canvas_disp = np.zeros((ih + extra_px, iw, 3), dtype=canvas.dtype)
+    else:
+        canvas_disp = None
 
     # Click flag shared with the mouse callback
     click_state = {"clicked": False, "x": None, "y": None}
@@ -119,15 +130,29 @@ def main():
 
     try:
         while True:
-            # Show the current canvas
-            cv2.imshow(args.window, canvas)
+            if args.bake_stretch:
+                # Show baked stretched canvas 1:1 (no per-frame rescale)
+                cv2.imshow(args.window, canvas_disp)
+                out_h = ih + extra_px
+                display = canvas_disp  # for click mapping dimensions
+            else:
+                # Render a taller view by a fixed extra_px (width unchanged)
+                out_h = ih + extra_px
+                display = cv2.resize(canvas, (iw, out_h), interpolation=cv2.INTER_LANCZOS4)
+                cv2.imshow(args.window, display)
 
             # Process one update on the clicked grid cell
             if click_state["clicked"]:
                 cx, cy = click_state["x"], click_state["y"]
                 # Map pixel coordinates to grid indices
-                i = index_from_edges(row_edges, cy)
-                j = index_from_edges(col_edges, cx)
+                # Invert the 10% vertical stretch for coordinate mapping
+                oy = int(round(cy / stretch_y))
+                ox = cx
+                # Clamp to original bounds
+                oy = max(0, min(ih - 1, oy))
+                ox = max(0, min(iw - 1, ox))
+                i = index_from_edges(row_edges, oy)
+                j = index_from_edges(col_edges, ox)
                 cell = (i, j)
                 pieces = grid_pieces[cell]
 
@@ -137,7 +162,16 @@ def main():
                 piece = pieces[idx]
                 y0, y1 = row_edges[i], row_edges[i+1]
                 x0, x1 = col_edges[j], col_edges[j+1]
+                # Update base canvas
                 canvas[y0:y1, x0:x1] = piece
+                # If baking, also write the stretched piece into the stretched canvas
+                if args.bake_stretch:
+                    y0s = int(round(y0 * stretch_y))
+                    y1s = int(round(y1 * stretch_y))
+                    target_h = max(1, y1s - y0s)
+                    target_w = max(1, x1 - x0)
+                    piece_stretched = cv2.resize(piece, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+                    canvas_disp[y0s:y1s, x0:x1] = piece_stretched
                 current_idx[cell] = idx
 
                 # consume the click
@@ -150,6 +184,8 @@ def main():
                 break
             elif key == ord('r'):
                 canvas[:] = 0
+                if args.bake_stretch:
+                    canvas_disp[:] = 0
                 for k in current_idx:
                     current_idx[k] = -1
 
