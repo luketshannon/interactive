@@ -19,6 +19,7 @@ import numpy as np
 import argparse
 import sys
 from ctypes import cdll, c_uint32
+from ctypes import util as ctypes_util
 
 def _screen_size_via_tk():
     try:
@@ -129,23 +130,33 @@ def main():
     # Create window and attempt fullscreen; we will always scale to window size
     cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
     ih, iw = images[0].shape[:2]
-    # Determine fullscreen target size: prefer CoreGraphics on macOS, then Tk, then window rect
+    # Determine fullscreen target size: prefer CoreGraphics (true pixels) on macOS,
+    # then Tk (scaled for Retina), then window rect, then image size.
     def _screen_target_size():
         if sys.platform == 'darwin':
+            # Try ApplicationServices (CoreGraphics) for real pixel dimensions
             try:
-                cg = cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
-                cg.CGMainDisplayID.restype = c_uint32
-                did = cg.CGMainDisplayID()
-                cg.CGDisplayPixelsWide.restype = c_uint32
-                cg.CGDisplayPixelsHigh.restype = c_uint32
-                w = int(cg.CGDisplayPixelsWide(did))
-                h = int(cg.CGDisplayPixelsHigh(did))
-                if w > 0 and h > 0:
-                    return (w, h)
+                app_path = ctypes_util.find_library('ApplicationServices')
+                if app_path:
+                    app = cdll.LoadLibrary(app_path)
+                    app.CGMainDisplayID.restype = c_uint32
+                    did = app.CGMainDisplayID()
+                    app.CGDisplayPixelsWide.argtypes = [c_uint32]
+                    app.CGDisplayPixelsWide.restype = c_uint32
+                    app.CGDisplayPixelsHigh.argtypes = [c_uint32]
+                    app.CGDisplayPixelsHigh.restype = c_uint32
+                    w = int(app.CGDisplayPixelsWide(did))
+                    h = int(app.CGDisplayPixelsHigh(did))
+                    if w > 0 and h > 0:
+                        return (w, h)
             except Exception:
                 pass
         tk_size = _screen_size_via_tk()
         if tk_size:
+            # Tk often returns logical points (e.g., 1440x900 on a 2x Retina 2880x1800)
+            if sys.platform == 'darwin':
+                tw, th = tk_size
+                return (tw * 2, th * 2)
             return tk_size
         try:
             _, _, _w, _h = cv2.getWindowImageRect(args.window)
@@ -156,11 +167,16 @@ def main():
         return (iw, ih)
     fs_size = _screen_target_size()
     fs_w, fs_h = fs_size
+    # Set fullscreen with robust fallback
     try:
-        # Prefer DESKTOP fullscreen so the window matches desktop resolution
-        cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN_DESKTOP)
-    except Exception:
-        pass
+        fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
+        if fs_desktop is not None:
+            cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
+        else:
+            cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    except Exception as e:
+        if debug:
+            print(f"Fullscreen set error: {e}", flush=True)
     try:
         fs_prop = cv2.getWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN)
         dprint(f"Initial fullscreen property: {fs_prop}; target size: {fs_w}x{fs_h}")
@@ -196,7 +212,11 @@ def main():
             key = cv2.waitKey(16) & 0xFF
             # Ensure fullscreen stays active and draw to the fullscreen target size
             try:
-                cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN_DESKTOP)
+                fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
+                if fs_desktop is not None:
+                    cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
+                else:
+                    cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
             except Exception as e:
                 dprint(f"setWindowProperty fullscreen error: {e}")
             # Observe window rect and fullscreen property (debug)
