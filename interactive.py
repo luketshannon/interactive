@@ -18,6 +18,7 @@ import cv2
 import numpy as np
 import argparse
 import sys
+import os
 from ctypes import cdll, c_uint32
 from ctypes import util as ctypes_util
 
@@ -40,6 +41,8 @@ def parse_args():
     parser.add_argument('--cols', type=int, default=4, help="Grid cols (default: 4).")
     parser.add_argument('--window', type=str, default='sleeping', help="Window name (default: 'sleeping').")
     parser.add_argument('--debug', action='store_true', help="Enable verbose debug logging to stdout.")
+    parser.add_argument('--windowed', action='store_true', help="Use windowed mode sized to screen pixels instead of fullscreen.")
+    parser.add_argument('--hidpi', action='store_true', help="Hint Qt backend to use HiDPI (macOS); set before window creation.")
     return parser.parse_args()
 
 def load_images(image_files):
@@ -111,6 +114,13 @@ def main():
     def dprint(*a):
         if debug:
             print(*a, flush=True)
+    # Encourage HiDPI for Qt backends on macOS before creating windows
+    if args.hidpi and sys.platform == 'darwin':
+        os.environ.setdefault('QT_ENABLE_HIGHDPI_SCALING', '1')
+        os.environ.setdefault('QT_AUTO_SCREEN_SCALE_FACTOR', '0')
+        os.environ.setdefault('QT_SCALE_FACTOR', '1')
+        os.environ.setdefault('QT_SCALE_FACTOR_ROUNDING_POLICY', 'PassThrough')
+        dprint("HiDPI env set for Qt")
     images = load_images(args.images)
     images = resize_to_smallest(images)
     # Report the unified working resolution after any resizing
@@ -167,16 +177,24 @@ def main():
         return (iw, ih)
     fs_size = _screen_target_size()
     fs_w, fs_h = fs_size
-    # Set fullscreen with robust fallback
-    try:
-        fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
-        if fs_desktop is not None:
-            cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
-        else:
-            cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-    except Exception as e:
-        if debug:
-            print(f"Fullscreen set error: {e}", flush=True)
+    if args.windowed:
+        # Windowed mode: size and move window to the detected pixel resolution
+        try:
+            cv2.resizeWindow(args.window, fs_w, fs_h)
+            cv2.moveWindow(args.window, 0, 0)
+        except Exception as e:
+            dprint(f"resizeWindow/moveWindow error: {e}")
+    else:
+        # Set fullscreen with robust fallback
+        try:
+            fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
+            if fs_desktop is not None:
+                cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
+            else:
+                cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+        except Exception as e:
+            if debug:
+                print(f"Fullscreen set error: {e}", flush=True)
     try:
         fs_prop = cv2.getWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN)
         dprint(f"Initial fullscreen property: {fs_prop}; target size: {fs_w}x{fs_h}")
@@ -207,18 +225,23 @@ def main():
         frame = 0
         last_rect = None
         last_fs_prop = None
+        # Use a crisp filter; Lanczos4 generally looks sharpest for both up/down scaling
+        def interp_for(src_w, src_h, dst_w, dst_h):
+            return cv2.INTER_LANCZOS4
+        scale_fix_applied = False
         while True:
             # Pump events first so window size is up-to-date
             key = cv2.waitKey(16) & 0xFF
             # Ensure fullscreen stays active and draw to the fullscreen target size
-            try:
-                fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
-                if fs_desktop is not None:
-                    cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
-                else:
-                    cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
-            except Exception as e:
-                dprint(f"setWindowProperty fullscreen error: {e}")
+            if not args.windowed:
+                try:
+                    fs_desktop = getattr(cv2, 'WINDOW_FULLSCREEN_DESKTOP', None)
+                    if fs_desktop is not None:
+                        cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, fs_desktop)
+                    else:
+                        cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+                except Exception as e:
+                    dprint(f"setWindowProperty fullscreen error: {e}")
             # Observe window rect and fullscreen property (debug)
             rect_now = None
             try:
@@ -232,13 +255,39 @@ def main():
                 dprint(f"getWindowProperty(WND_PROP_FULLSCREEN) error: {e}")
             # Compute draw size and render
             win_w, win_h = draw_size()
-            display = cv2.resize(canvas, (win_w, win_h), interpolation=cv2.INTER_NEAREST)
+            inter = interp_for(iw, ih, win_w, win_h)
+            display = cv2.resize(canvas, (win_w, win_h), interpolation=inter)
             cv2.imshow(args.window, display)
             # Log on interesting frames or changes
             if (frame < 10) or (rect_now != last_rect) or (fs_prop_now != last_fs_prop):
-                dprint(f"frame={frame} rect={rect_now} fs_prop={fs_prop_now} draw={win_w}x{win_h} canvas={iw}x{ih}")
+                # Estimate device pixel ratio from rect if available
+                dpr = None
+                if rect_now is not None and len(rect_now) == 4 and rect_now[2] > 0 and rect_now[3] > 0:
+                    try:
+                        dpr_w = round(win_w / max(int(rect_now[2]), 1), 2)
+                        dpr_h = round(win_h / max(int(rect_now[3]), 1), 2)
+                        dpr = f"~{dpr_w}x{dpr_h}"
+                    except Exception:
+                        dpr = None
+                dprint(f"frame={frame} rect={rect_now} fs_prop={fs_prop_now} draw={win_w}x{win_h} canvas={iw}x{ih} inter={inter} dpr={dpr}")
                 last_rect = rect_now
                 last_fs_prop = fs_prop_now
+                # If running windowed on macOS and we detect a low-DPI (dpr≈1), try doubling the window size
+                if args.windowed and sys.platform == 'darwin' and rect_now is not None and not scale_fix_applied:
+                    rw, rh = int(rect_now[2]), int(rect_now[3])
+                    if rw > 0 and rh > 0:
+                        dprw = win_w / rw
+                        dprh = win_h / rh
+                        if 0.95 <= dprw <= 1.05 and 0.95 <= dprh <= 1.05:
+                            try:
+                                new_w, new_h = win_w * 2, win_h * 2
+                                cv2.resizeWindow(args.window, new_w, new_h)
+                                cv2.moveWindow(args.window, 0, 0)
+                                fs_w, fs_h = new_w, new_h
+                                scale_fix_applied = True
+                                dprint(f"Applied windowed HiDPI fix: resized to {new_w}x{new_h}")
+                            except Exception as e:
+                                dprint(f"HiDPI resize attempt failed: {e}")
             frame += 1
 
             # Process one update on the clicked grid cell
