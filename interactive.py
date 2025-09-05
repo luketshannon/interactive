@@ -17,8 +17,19 @@ Controls:
 import cv2
 import numpy as np
 import argparse
-import random
 import sys
+from ctypes import cdll, c_uint32
+
+def _screen_size_via_tk():
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+        root.withdraw()
+        w, h = root.winfo_screenwidth(), root.winfo_screenheight()
+        root.destroy()
+        return int(w), int(h)
+    except Exception:
+        return None
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -27,15 +38,19 @@ def parse_args():
     parser.add_argument('--rows', type=int, default=5, help="Grid rows (default: 5).")
     parser.add_argument('--cols', type=int, default=4, help="Grid cols (default: 4).")
     parser.add_argument('--window', type=str, default='sleeping', help="Window name (default: 'sleeping').")
+    parser.add_argument('--debug', action='store_true', help="Enable verbose debug logging to stdout.")
     return parser.parse_args()
 
 def load_images(image_files):
     imgs = []
+    print("Input images (WxH):")
     for file in image_files:
         img = cv2.imread(file)
         if img is None:
             print(f"Error: Unable to load image '{file}'", file=sys.stderr)
             sys.exit(1)
+        h, w = img.shape[:2]
+        print(f"  - {file}: {w}x{h}")
         imgs.append(img)
     return imgs
 
@@ -85,9 +100,22 @@ def index_from_edges(edges, coord):
     return len(edges) - 2
 
 def main():
+    # Ensure stdout is line-buffered so prints appear promptly
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     args = parse_args()
+    debug = args.debug
+    def dprint(*a):
+        if debug:
+            print(*a, flush=True)
     images = load_images(args.images)
     images = resize_to_smallest(images)
+    # Report the unified working resolution after any resizing
+    wh, ww = images[0].shape[:2]
+    print(f"Working resolution (WxH): {ww}x{wh}")
+    dprint(f"OpenCV version: {cv2.__version__}; platform: {sys.platform}")
 
     rows, cols = args.rows, args.cols
     grid_pieces, row_edges, col_edges = split_images_to_grid(images, rows=rows, cols=cols)
@@ -98,13 +126,55 @@ def main():
     # Track which source index is currently used for each cell (-1 = black)
     current_idx = {(i, j): -1 for i in range(rows) for j in range(cols)}
 
-    # Create window; AUTOSIZE keeps 1:1 pixel mapping with mouse events
-    cv2.namedWindow(args.window, cv2.WINDOW_AUTOSIZE)
+    # Create window and attempt fullscreen; we will always scale to window size
+    cv2.namedWindow(args.window, cv2.WINDOW_NORMAL)
+    ih, iw = images[0].shape[:2]
+    # Determine fullscreen target size: prefer CoreGraphics on macOS, then Tk, then window rect
+    def _screen_target_size():
+        if sys.platform == 'darwin':
+            try:
+                cg = cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+                cg.CGMainDisplayID.restype = c_uint32
+                did = cg.CGMainDisplayID()
+                cg.CGDisplayPixelsWide.restype = c_uint32
+                cg.CGDisplayPixelsHigh.restype = c_uint32
+                w = int(cg.CGDisplayPixelsWide(did))
+                h = int(cg.CGDisplayPixelsHigh(did))
+                if w > 0 and h > 0:
+                    return (w, h)
+            except Exception:
+                pass
+        tk_size = _screen_size_via_tk()
+        if tk_size:
+            return tk_size
+        try:
+            _, _, _w, _h = cv2.getWindowImageRect(args.window)
+            if _w > 0 and _h > 0:
+                return (int(_w), int(_h))
+        except Exception:
+            pass
+        return (iw, ih)
+    fs_size = _screen_target_size()
+    fs_w, fs_h = fs_size
+    try:
+        # Prefer DESKTOP fullscreen so the window matches desktop resolution
+        cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN_DESKTOP)
+    except Exception:
+        pass
+    try:
+        fs_prop = cv2.getWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN)
+        dprint(f"Initial fullscreen property: {fs_prop}; target size: {fs_w}x{fs_h}")
+    except Exception as e:
+        dprint(f"Could not read fullscreen property initially: {e}")
+    # Always return the cached fullscreen size for drawing
+    def draw_size():
+        return fs_w, fs_h
 
     # Click flag shared with the mouse callback
     click_state = {"clicked": False, "x": None, "y": None}
 
     def on_mouse(event, x, y, flags, param):
+        # Only act on left-button clicks; ignore right/middle clicks and drags
         if event == cv2.EVENT_LBUTTONDOWN:
             param["clicked"] = True
             param["x"] = x
@@ -118,18 +188,53 @@ def main():
     print("  • 'q' or ESC to quit")
 
     try:
+        frame = 0
+        last_rect = None
+        last_fs_prop = None
         while True:
-            # Show the current canvas
-            cv2.imshow(args.window, canvas)
+            # Pump events first so window size is up-to-date
+            key = cv2.waitKey(16) & 0xFF
+            # Ensure fullscreen stays active and draw to the fullscreen target size
+            try:
+                cv2.setWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN_DESKTOP)
+            except Exception as e:
+                dprint(f"setWindowProperty fullscreen error: {e}")
+            # Observe window rect and fullscreen property (debug)
+            rect_now = None
+            try:
+                rect_now = cv2.getWindowImageRect(args.window)
+            except Exception as e:
+                dprint(f"getWindowImageRect error: {e}")
+            fs_prop_now = None
+            try:
+                fs_prop_now = cv2.getWindowProperty(args.window, cv2.WND_PROP_FULLSCREEN)
+            except Exception as e:
+                dprint(f"getWindowProperty(WND_PROP_FULLSCREEN) error: {e}")
+            # Compute draw size and render
+            win_w, win_h = draw_size()
+            display = cv2.resize(canvas, (win_w, win_h), interpolation=cv2.INTER_NEAREST)
+            cv2.imshow(args.window, display)
+            # Log on interesting frames or changes
+            if (frame < 10) or (rect_now != last_rect) or (fs_prop_now != last_fs_prop):
+                dprint(f"frame={frame} rect={rect_now} fs_prop={fs_prop_now} draw={win_w}x{win_h} canvas={iw}x{ih}")
+                last_rect = rect_now
+                last_fs_prop = fs_prop_now
+            frame += 1
 
             # Process one update on the clicked grid cell
             if click_state["clicked"]:
                 cx, cy = click_state["x"], click_state["y"]
+                # Map using the just-drawn frame's size
+                dw, dh = display.shape[1], display.shape[0]
+                # Clamp and scale
+                ox = min(max(int(round(cx / max(dw, 1) * iw)), 0), iw - 1)
+                oy = min(max(int(round(cy / max(dh, 1) * ih)), 0), ih - 1)
                 # Map pixel coordinates to grid indices
-                i = index_from_edges(row_edges, cy)
-                j = index_from_edges(col_edges, cx)
+                i = index_from_edges(row_edges, oy)
+                j = index_from_edges(col_edges, ox)
                 cell = (i, j)
                 pieces = grid_pieces[cell]
+                dprint(f"click: win=({cx},{cy}) draw={dw}x{dh} -> img=({ox},{oy}) cell=({i},{j}) idx_prev={current_idx[cell]}")
 
                 # Cycle forward through images for this cell (wrap at the end)
                 idx = (current_idx[cell] + 1) % len(pieces)
@@ -145,13 +250,14 @@ def main():
                 click_state["x"], click_state["y"] = None, None
 
             # Handle keys
-            key = cv2.waitKey(20) & 0xFF
             if key in (ord('q'), 27):  # ESC or 'q'
+                dprint("quit requested")
                 break
             elif key == ord('r'):
                 canvas[:] = 0
                 for k in current_idx:
                     current_idx[k] = -1
+                dprint("canvas reset")
 
     except KeyboardInterrupt:
         print("Interrupted.")
